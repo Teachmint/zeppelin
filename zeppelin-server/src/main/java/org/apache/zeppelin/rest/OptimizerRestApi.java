@@ -33,15 +33,18 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * OptimizerRestApi — Zeppelin REST endpoint that proxies to Vertex AI (Gemini).
+ * OptimizerRestApi — Zeppelin REST endpoint that calls Vertex AI (Gemini) directly.
  *
- * Configuration is read entirely from the service account JSON key file.
- * The key file path is read from the environment variable:
- *   GOOGLE_APPLICATION_CREDENTIALS
- * If not set, falls back to zeppelin-env.sh or the system default location.
+ * Configuration via environment variables in zeppelin-env.sh:
+ *   GPATH     — path to GCP service account JSON key file (required)
+ *   area      — GCP region (optional, default: us-central1)
+ *   AI_MODEL  — Vertex AI model name (optional, default: gemini-2.5-flash)
  *
- * Nothing is hardcoded — project, region, model, token_uri, client_email
- * and private_key are all read from the service account JSON at runtime.
+ * Nothing is hardcoded. Project ID, client email, private key and token URI
+ * are all read from the service account JSON at runtime.
+ *
+ * Auth uses pure JDK JWT flow — no Google Auth library, no gcloud,
+ * no side effects on other GCP services running on this VM.
  *
  * Registered path: POST /api/optimizer/optimize
  */
@@ -51,25 +54,25 @@ public class OptimizerRestApi {
 
     private static final Logger LOG = LoggerFactory.getLogger(OptimizerRestApi.class);
 
-    // ── Read key file path from environment — nothing hardcoded ──────────────
-    // Priority:
-    //   1. GOOGLE_APPLICATION_CREDENTIALS env var
-    //   2. OPTIMIZER_KEY_FILE env var (Zeppelin-specific override)
-    //   3. zeppelin.optimizer.key.file system property
-    private static final String KEY_FILE = resolveKeyFile();
+    // ── Environment variable names ────────────────────────────────────────────
+    private static final String KEY_FILE    = resolveKeyFile();
+    private static final String GEMINI_MODEL = System.getenv().getOrDefault("AI_MODEL", "gemini-2.5-flash");
+    private static final String GCP_REGION   = System.getenv().getOrDefault("area", "us-central1");
 
-    // ── Model and region read from env — fallback to values in key file ───────
-    // Set these in zeppelin-env.sh if you want to override:
-    //   export VERTEX_MODEL=gemini-2.5-flash
-    //   export GCP_REGION=asia-south1
-    private static final String GEMINI_MODEL = System.getenv().getOrDefault(
-        "AI_MODEL", "gemini-2.5-flash");
-    private static final String GCP_REGION_OVERRIDE = System.getenv("area");
+    private static final String VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
+    private static final int    TIMEOUT_MS   = 60_000;
 
-    private static final String VERTEX_SCOPE =
-        "https://www.googleapis.com/auth/cloud-platform";
+    // ── Size limits to prevent OOM and API rejections ─────────────────────────
+    private static final int MAX_SQL_LENGTH     = 100_000;
+    private static final int MAX_EXPLAIN_LENGTH = 500_000;
 
-    private static final int TIMEOUT_MS = 60_000;
+    // ── Token caching — shared across requests, refreshed before expiry ───────
+    private static volatile ServiceAccountInfo cachedSaInfo       = null;
+    private static volatile String             cachedToken        = null;
+    private static volatile long               tokenExpiryTimeMs  = 0;
+    private static final   Object              lock               = new Object();
+    private static final   long TOKEN_LIFETIME_MS      = 3600L * 1000L; // 1 hour
+    private static final   long TOKEN_REFRESH_BUFFER_MS =  300L * 1000L; // 5 min buffer
 
     private static final String SYSTEM_PROMPT =
         "You are an Apache Spark SQL performance expert.\n\n" +
@@ -100,22 +103,17 @@ public class OptimizerRestApi {
 
     private final Gson gson = new Gson();
 
-    // ── Resolve key file path from environment ────────────────────────────────
+    // ── Resolve key file path from GPATH env var ──────────────────────────────
     private static String resolveKeyFile() {
-        // 1. Standard Google env var
+        // 1. GPATH environment variable (set in zeppelin-env.sh)
         String path = System.getenv("GPATH");
         if (path != null && !path.trim().isEmpty()) return path.trim();
 
-        // 2. Zeppelin-specific override
-        path = System.getenv("GPATH");
+        // 2. Java system property fallback (-DGPATH=...)
+        path = System.getProperty("GPATH");
         if (path != null && !path.trim().isEmpty()) return path.trim();
 
-        // 3. Java system property
-        path = System.getenv("GPATH");
-        if (path != null && !path.trim().isEmpty()) return path.trim();
-
-        // 4. No path found — will fail at runtime with a clear error message
-        return null;
+        return null; // Will trigger clear error message at runtime
     }
 
     // ── POST /api/optimizer/optimize ──────────────────────────────────────────
@@ -125,7 +123,7 @@ public class OptimizerRestApi {
     @Produces(MediaType.APPLICATION_JSON)
     public Response optimize(String requestBody) {
 
-        // 1. Shiro authentication check
+        // 1. Shiro authentication — Layer 2 (Layer 1 is the Shiro filter)
         Subject currentUser = SecurityUtils.getSubject();
         if (!currentUser.isAuthenticated()) {
             LOG.warn("Unauthenticated request to /api/optimizer/optimize");
@@ -133,13 +131,11 @@ public class OptimizerRestApi {
                 "Not authenticated. Please log in to Zeppelin first.").build();
         }
 
-        // 2. Validate key file is configured
+        // 2. Check GPATH is configured
         if (KEY_FILE == null) {
-            LOG.error("No service account key file configured. " +
-                "Set GPATH in zeppelin-env.sh");
+            LOG.error("Optimizer not configured: GPATH environment variable is not set.");
             return new JsonResponse<>(Response.Status.INTERNAL_SERVER_ERROR,
-                "Optimizer not configured: GPATH is not set. " +
-                "Add it to zeppelin-env.sh").build();
+                "Optimizer not configured: GPATH is not set in zeppelin-env.sh").build();
         }
 
         // 3. Validate request body
@@ -161,7 +157,7 @@ public class OptimizerRestApi {
                 "Request body must contain 'sql_query'.").build();
         }
 
-        String sqlQuery = parsed.get("sql_query").getAsString().trim();
+        String sqlQuery      = parsed.get("sql_query").getAsString().trim();
         String explainOutput = parsed.has("explain_output")
             ? parsed.get("explain_output").getAsString().trim() : "";
 
@@ -170,30 +166,31 @@ public class OptimizerRestApi {
                 "sql_query is too short.").build();
         }
 
+        // FIX 2: Use BAD_REQUEST (400) — REQUEST_ENTITY_TOO_LARGE does not exist
+        // in javax.ws.rs.core.Response.Status and causes a compile error
+        if (sqlQuery.length() > MAX_SQL_LENGTH || explainOutput.length() > MAX_EXPLAIN_LENGTH) {
+            return new JsonResponse<>(Response.Status.BAD_REQUEST,
+                "Query or explain output exceeds size limits. " +
+                "Max SQL: " + MAX_SQL_LENGTH + " chars, " +
+                "Max EXPLAIN: " + MAX_EXPLAIN_LENGTH + " chars.").build();
+        }
+
         LOG.info("Optimizing SQL for user '{}': {}...",
             currentUser.getPrincipal(),
             sqlQuery.substring(0, Math.min(80, sqlQuery.length())));
 
         try {
-            // 4. Load service account and get token — everything read from JSON
-            ServiceAccountInfo sa = loadServiceAccount();
-            String accessToken = getAccessToken(sa);
-            String vertexUrl = buildVertexUrl(sa.projectId);
+            ServiceAccountInfo sa  = getServiceAccountInfo();
+            String accessToken     = getValidAccessToken(sa);
+            String vertexUrl       = buildVertexUrl(sa.projectId);
+            String geminiResult    = callVertexAI(accessToken, vertexUrl, sqlQuery, explainOutput);
+            String cleanedJson     = extractJsonFromMarkdown(geminiResult);
 
-            // 5. Call Vertex AI
-            String geminiResult = callVertexAI(accessToken, vertexUrl, sqlQuery, explainOutput);
-
-            // 6. Parse and return result
             JsonObject resultJson;
             try {
-                String cleaned = geminiResult
-                    .replaceAll("(?s)^```json\\s*", "")
-                    .replaceAll("(?s)^```\\s*",     "")
-                    .replaceAll("(?s)\\s*```$",     "")
-                    .trim();
-                resultJson = JsonParser.parseString(cleaned).getAsJsonObject();
+                resultJson = JsonParser.parseString(cleanedJson).getAsJsonObject();
             } catch (Exception e) {
-                LOG.warn("Gemini returned non-JSON response, wrapping as raw_response");
+                LOG.warn("Gemini returned non-JSON response, wrapping as raw_response.");
                 JsonObject fallback = new JsonObject();
                 fallback.addProperty("raw_response", geminiResult);
                 return new JsonResponse<>(Response.Status.OK, fallback).build();
@@ -202,87 +199,134 @@ public class OptimizerRestApi {
             return new JsonResponse<>(Response.Status.OK, resultJson).build();
 
         } catch (VertexAuthException e) {
-            LOG.error("Vertex AI auth failed: {}", e.getMessage());
+            // FIX 1: Clear token cache on auth failure so next request forces refresh
+            synchronized (lock) {
+                cachedToken       = null;
+                tokenExpiryTimeMs = 0;
+            }
+            LOG.error("Vertex AI auth failed, token cache cleared: {}", e.getMessage());
             return new JsonResponse<>(Response.Status.INTERNAL_SERVER_ERROR,
                 "Auth failed: " + e.getMessage()).build();
+
         } catch (VertexCallException e) {
             LOG.error("Vertex AI call failed ({}): {}", e.statusCode, e.getMessage());
             return new JsonResponse<>(Response.Status.SERVICE_UNAVAILABLE,
                 "Vertex AI error (" + e.statusCode + "): " + e.getMessage()).build();
+
         } catch (IOException e) {
-            LOG.error("I/O error: {}", e.getMessage());
+            LOG.error("I/O error during optimization: {}", e.getMessage(), e);
             return new JsonResponse<>(Response.Status.INTERNAL_SERVER_ERROR,
                 "I/O error: " + e.getMessage()).build();
-        }
-    }
 
-    // ── Service account info read entirely from JSON key file ─────────────────
-    private static class ServiceAccountInfo {
-        String clientEmail;   // from key file: client_email
-        String privateKeyPem; // from key file: private_key
-        String tokenUri;      // from key file: token_uri
-        String projectId;     // from key file: project_id
-        String region;        // from env GCP_REGION, fallback "us-central1"
-    }
-
-    private ServiceAccountInfo loadServiceAccount() throws VertexAuthException {
-        try {
-            String keyJson = new String(
-                Files.readAllBytes(Paths.get(KEY_FILE)), StandardCharsets.UTF_8);
-            JsonObject keyObj = JsonParser.parseString(keyJson).getAsJsonObject();
-
-            ServiceAccountInfo sa = new ServiceAccountInfo();
-            sa.clientEmail   = keyObj.get("client_email").getAsString();
-            sa.privateKeyPem = keyObj.get("private_key").getAsString();
-            sa.tokenUri      = keyObj.get("token_uri").getAsString();
-            sa.projectId     = keyObj.get("project_id").getAsString();
-
-            // Region: env var takes priority, otherwise default to us-central1
-            sa.region = (GCP_REGION_OVERRIDE != null && !GCP_REGION_OVERRIDE.isEmpty())
-                ? GCP_REGION_OVERRIDE : "us-central1";
-
-            LOG.info("Loaded service account: {} | project: {} | region: {}",
-                sa.clientEmail, sa.projectId, sa.region);
-            return sa;
-
-        } catch (IOException e) {
-            throw new VertexAuthException(
-                "Cannot read service account key from '" + KEY_FILE + "': " + e.getMessage() +
-                ". Check that GOOGLE_APPLICATION_CREDENTIALS is set correctly in zeppelin-env.sh");
         } catch (Exception e) {
-            throw new VertexAuthException(
-                "Invalid service account JSON at '" + KEY_FILE + "': " + e.getMessage());
+            LOG.error("Unexpected error during optimization", e);
+            return new JsonResponse<>(Response.Status.INTERNAL_SERVER_ERROR,
+                "Unexpected error: " + e.getMessage()).build();
         }
     }
 
-    // ── Build Vertex AI URL from service account project + env region ─────────
+    // ── Extract JSON from markdown fences if present ──────────────────────────
+    private String extractJsonFromMarkdown(String text) {
+        String cleaned = text.trim();
+        if (cleaned.startsWith("```json")) {
+            cleaned = cleaned.substring(7);
+        } else if (cleaned.startsWith("```")) {
+            cleaned = cleaned.substring(3);
+        }
+        if (cleaned.endsWith("```")) {
+            cleaned = cleaned.substring(0, cleaned.length() - 3);
+        }
+        return cleaned.trim();
+    }
+
+    // ── Service account — loaded and cached once ──────────────────────────────
+    private static class ServiceAccountInfo {
+        String     clientEmail;
+        PrivateKey privateKey;  // RSA key parsed once and held in memory
+        String     tokenUri;
+        String     projectId;
+    }
+
+    private ServiceAccountInfo getServiceAccountInfo() throws VertexAuthException {
+        if (cachedSaInfo != null) return cachedSaInfo;
+
+        synchronized (lock) {
+            if (cachedSaInfo != null) return cachedSaInfo;
+
+            try {
+                String keyJson = new String(
+                    Files.readAllBytes(Paths.get(KEY_FILE)), StandardCharsets.UTF_8);
+                JsonObject keyObj = JsonParser.parseString(keyJson).getAsJsonObject();
+
+                ServiceAccountInfo sa = new ServiceAccountInfo();
+                sa.clientEmail = keyObj.get("client_email").getAsString();
+                sa.tokenUri    = keyObj.get("token_uri").getAsString();
+                sa.projectId   = keyObj.get("project_id").getAsString();
+
+                // Parse RSA private key once — expensive operation, cache the result
+                String pem = keyObj.get("private_key").getAsString()
+                    .replace("-----BEGIN PRIVATE KEY-----", "")
+                    .replace("-----END PRIVATE KEY-----", "")
+                    .replaceAll("\\s", "");
+                byte[] keyBytes = Base64.getDecoder().decode(pem);
+                sa.privateKey = KeyFactory.getInstance("RSA")
+                    .generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+
+                LOG.info("Loaded service account: {} | project: {} | region: {} | model: {}",
+                    sa.clientEmail, sa.projectId, GCP_REGION, GEMINI_MODEL);
+                cachedSaInfo = sa;
+                return sa;
+
+            } catch (IOException e) {
+                throw new VertexAuthException(
+                    "Cannot read service account key from GPATH='" + KEY_FILE +
+                    "': " + e.getMessage());
+            } catch (Exception e) {
+                throw new VertexAuthException(
+                    "Invalid service account JSON at '" + KEY_FILE +
+                    "': " + e.getMessage());
+            }
+        }
+    }
+
+    // ── Build Vertex AI URL from project ID + region + model ─────────────────
     private String buildVertexUrl(String projectId) {
-        String region = (GCP_REGION_OVERRIDE != null && !GCP_REGION_OVERRIDE.isEmpty())
-            ? GCP_REGION_OVERRIDE : "us-central1";
         return String.format(
             "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s" +
             "/publishers/google/models/%s:generateContent",
-            region, projectId, region, GEMINI_MODEL
+            GCP_REGION, projectId, GCP_REGION, GEMINI_MODEL
         );
     }
 
-    // ── OAuth2 JWT flow — pure JDK, no external libraries ────────────────────
-    // Reads everything from the service account JSON.
-    // Does NOT touch gcloud. Does NOT switch active accounts.
-    // Has zero side effects on other GCP services.
-    private String getAccessToken(ServiceAccountInfo sa) throws VertexAuthException {
-        try {
-            // 1. Parse RSA private key from PEM
-            String pem = sa.privateKeyPem
-                .replace("-----BEGIN PRIVATE KEY-----", "")
-                .replace("-----END PRIVATE KEY-----", "")
-                .replaceAll("\\s", "");
-            byte[] keyBytes = Base64.getDecoder().decode(pem);
-            PrivateKey privateKey = KeyFactory.getInstance("RSA")
-                .generatePrivate(new PKCS8EncodedKeySpec(keyBytes));
+    // ── Token management — cached, refreshed 5 min before expiry ─────────────
+    private String getValidAccessToken(ServiceAccountInfo sa) throws VertexAuthException {
+        long now = System.currentTimeMillis();
 
-            // 2. Build JWT header + claims
-            long now = System.currentTimeMillis() / 1000;
+        // Fast path — return cached token if still valid
+        if (cachedToken != null && now < (tokenExpiryTimeMs - TOKEN_REFRESH_BUFFER_MS)) {
+            return cachedToken;
+        }
+
+        // Slow path — fetch new token inside lock
+        synchronized (lock) {
+            // Double-check after acquiring lock
+            if (cachedToken != null && now < (tokenExpiryTimeMs - TOKEN_REFRESH_BUFFER_MS)) {
+                return cachedToken;
+            }
+            cachedToken       = fetchNewAccessToken(sa);
+            tokenExpiryTimeMs = System.currentTimeMillis() + TOKEN_LIFETIME_MS;
+            LOG.info("Token cache refreshed, valid for 1 hour.");
+            return cachedToken;
+        }
+    }
+
+    // ── OAuth2 JWT flow — pure JDK, no external libraries ────────────────────
+    // Reads private key from service account JSON.
+    // Does NOT touch gcloud. Does NOT switch active accounts.
+    // Zero side effects on other GCP services on this VM.
+    private String fetchNewAccessToken(ServiceAccountInfo sa) throws VertexAuthException {
+        try {
+            long now    = System.currentTimeMillis() / 1000;
             String header = base64url(
                 "{\"alg\":\"RS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
 
@@ -294,14 +338,12 @@ public class OptimizerRestApi {
             claimsMap.put("exp",   now + 3600);
             String claims = base64url(gson.toJson(claimsMap).getBytes(StandardCharsets.UTF_8));
 
-            // 3. Sign JWT with RS256
             String signingInput = header + "." + claims;
             Signature signer = Signature.getInstance("SHA256withRSA");
-            signer.initSign(privateKey);
+            signer.initSign(sa.privateKey);
             signer.update(signingInput.getBytes(StandardCharsets.UTF_8));
             String jwt = signingInput + "." + base64url(signer.sign());
 
-            // 4. Exchange JWT for OAuth2 access token
             String postBody =
                 "grant_type=" + java.net.URLEncoder.encode(
                     "urn:ietf:params:oauth:grant-type:jwt-bearer", "UTF-8") +
@@ -313,29 +355,37 @@ public class OptimizerRestApi {
             conn.setConnectTimeout(10_000);
             conn.setReadTimeout(10_000);
             conn.setDoOutput(true);
-            conn.getOutputStream().write(postBody.getBytes(StandardCharsets.UTF_8));
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(postBody.getBytes(StandardCharsets.UTF_8));
+            }
 
             int status = conn.getResponseCode();
-            InputStream is = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            String resp = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            conn.disconnect();
+            String resp;
+            // FIX 3: InputStream wrapped in try-with-resources to prevent leak
+            try (InputStream is = status >= 400
+                    ? conn.getErrorStream()
+                    : conn.getInputStream()) {
+                resp = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            } finally {
+                conn.disconnect();
+            }
 
             if (status >= 400) {
                 throw new VertexAuthException(
                     "Token endpoint returned " + status + ": " + resp);
             }
 
-            String token = JsonParser.parseString(resp)
+            LOG.info("New access token obtained via JWT for {} ✅", sa.clientEmail);
+            return JsonParser.parseString(resp)
                 .getAsJsonObject().get("access_token").getAsString();
-
-            LOG.info("Access token obtained via JWT for {} ✅", sa.clientEmail);
-            return token;
 
         } catch (VertexAuthException e) {
             throw e;
         } catch (Exception e) {
             throw new VertexAuthException(
-                "JWT auth failed: " + e.getClass().getSimpleName() + " — " + e.getMessage());
+                "JWT auth failed: " + e.getClass().getSimpleName() +
+                " — " + e.getMessage());
         }
     }
 
@@ -389,19 +439,27 @@ public class OptimizerRestApi {
             conn = (HttpURLConnection) new URL(vertexUrl).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Authorization", "Bearer " + accessToken);
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+            conn.setRequestProperty("Content-Type",  "application/json; charset=UTF-8");
             conn.setConnectTimeout(TIMEOUT_MS);
             conn.setReadTimeout(TIMEOUT_MS);
             conn.setDoOutput(true);
 
             byte[] body = gson.toJson(payload).getBytes(StandardCharsets.UTF_8);
             conn.setRequestProperty("Content-Length", String.valueOf(body.length));
-            try (OutputStream os = conn.getOutputStream()) { os.write(body); }
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body);
+            }
 
             int status = conn.getResponseCode();
             boolean isError = status >= 400;
-            InputStream is = isError ? conn.getErrorStream() : conn.getInputStream();
-            String responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+
+            // FIX 3 applied here too — InputStream in try-with-resources
+            String responseBody;
+            try (InputStream is = isError
+                    ? conn.getErrorStream()
+                    : conn.getInputStream()) {
+                responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            }
 
             if (isError) throw new VertexCallException(status, responseBody);
 
@@ -412,6 +470,7 @@ public class OptimizerRestApi {
                        .getAsJsonArray("parts")
                        .get(0).getAsJsonObject()
                        .get("text").getAsString();
+
         } finally {
             if (conn != null) conn.disconnect();
         }
