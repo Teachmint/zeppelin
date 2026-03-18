@@ -34,6 +34,7 @@ import org.apache.zeppelin.rest.SecurityRestApi;
 import org.apache.zeppelin.rest.SessionRestApi;
 import org.apache.zeppelin.rest.ZeppelinRestApi;
 import org.apache.zeppelin.rest.exception.WebApplicationExceptionMapper;
+import org.apache.zeppelin.rest.OptimizerRestApi;
 
 public class RestApiApplication extends Application {
   @Override
@@ -51,7 +52,7 @@ public class RestApiApplication extends Application {
     s.add(SecurityRestApi.class);
     s.add(SessionRestApi.class);
     s.add(ZeppelinRestApi.class);
-
+    s.add(OptimizerRestApi.class);
     // add ExceptionMapper
     s.add(WebApplicationExceptionMapper.class);
     return s;
